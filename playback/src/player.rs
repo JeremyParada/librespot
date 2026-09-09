@@ -1672,8 +1672,11 @@ impl Future for PlayerInternal {
 
             // Start overlapping with the next track once we are within the crossfade window of
             // the end. It has to be preloaded already, otherwise there is nothing to fade into.
-            let crossfade_ms = self.config.crossfade.as_millis() as u32;
-            if crossfade_ms > 0
+            let crossfade_ms = self
+                .config
+                .crossfade
+                .as_millis()
+                .min(u32::MAX as u128) as u32;
                 && !passthrough
                 && self.crossfade.is_none()
                 && matches!(self.preload, PlayerPreload::Ready { .. })
