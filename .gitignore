@@ -8,3 +8,6 @@ spotify_appkey.key
 .cache
 *.save
 *.*~
+
+# Cross-compiled Android output
+embed/jniLibs/
