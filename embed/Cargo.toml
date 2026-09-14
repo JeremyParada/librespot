@@ -1,0 +1,34 @@
+[package]
+name = "librespot-embed"
+version = "0.8.0"
+description = "Run librespot inside a host application, with no binary to exec"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lib]
+# `lib` so it can be driven from a normal Rust test on the desktop, `cdylib` so an
+# Android app can load it with System.loadLibrary.
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+librespot-core = { workspace = true }
+librespot-connect = { workspace = true }
+librespot-playback = { workspace = true }
+log = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.14"
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[features]
+default = []
+native-tls = ["librespot-core/native-tls"]
+rustls-tls-webpki-roots = ["librespot-core/rustls-tls-webpki-roots"]
+cast = ["librespot-playback/cast"]

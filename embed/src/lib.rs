@@ -1,0 +1,255 @@
+//! Runs librespot inside a host application instead of as a process to exec.
+//!
+//! On Android there is no binary to run: an app loads a `cdylib` and calls into it. That
+//! rules out the usual "ship the executable and spawn it" approach, which also fights the
+//! platform -- executing binaries out of an APK is something Android keeps tightening, and
+//! a child process is awkward for a foreground service to own.
+//!
+//! The platform-specific part is deliberately thin. Everything here is ordinary Rust that
+//! runs and can be tested on a desktop; only the JNI shim knows Android exists. Getting
+//! the wiring wrong on a laptop costs seconds, getting it wrong over `adb` costs an
+//! afternoon.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+
+use librespot_connect::{ConnectConfig, Spirc};
+use librespot_core::{Session, SessionConfig, cache::Cache};
+use librespot_playback::audio_backend;
+use librespot_playback::config::{AudioFormat, PlayerConfig};
+use librespot_playback::mixer::softmixer::SoftMixer;
+use librespot_playback::mixer::{Mixer, MixerConfig};
+use librespot_playback::player::Player;
+use log::{error, info};
+use tokio::sync::oneshot;
+
+#[cfg(target_os = "android")]
+mod jni_bridge;
+
+/// Everything the host has to decide. Kept small on purpose: anything with a sane default
+/// is not worth a knob the app has to thread through JNI.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Shown in Spotify's device list.
+    pub device_name: String,
+    /// Where the http backend listens, e.g. `0.0.0.0:8321`.
+    pub bind: String,
+    /// Exact name of the Cast device or group to drive, if any.
+    pub cast_to: Option<String>,
+    /// Seconds of overlap between tracks; 0 disables it.
+    pub crossfade_secs: u64,
+    /// Directory holding the credentials written by a previous OAuth sign-in.
+    pub cache_dir: PathBuf,
+}
+
+impl Config {
+    pub fn new(device_name: impl Into<String>, cache_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            device_name: device_name.into(),
+            bind: "0.0.0.0:8321".to_string(),
+            cast_to: None,
+            crossfade_secs: 0,
+            cache_dir: cache_dir.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    /// No cached credentials. The host has to run an OAuth sign-in first; this API
+    /// deliberately cannot do it, because it must never block on a browser.
+    NoCredentials,
+    Cache(String),
+    Session(String),
+    Backend(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::NoCredentials => write!(
+                f,
+                "no cached credentials; sign in once with --enable-device-auth first"
+            ),
+            Error::Cache(e) => write!(f, "cache: {e}"),
+            Error::Session(e) => write!(f, "session: {e}"),
+            Error::Backend(e) => write!(f, "backend: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// A running instance. Dropping it does **not** stop anything -- stopping is explicit, so
+/// a host that loses track of the handle does not silently kill the music.
+pub struct Handle {
+    stop: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Handle {
+    /// Stops playback and waits for the worker to wind down.
+    pub fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Starts librespot on its own thread and returns once it is running.
+///
+/// Returns early with [`Error::NoCredentials`] rather than starting a doomed worker, so a
+/// host can tell "not signed in yet" apart from "running".
+pub fn start(config: Config) -> Result<Handle, Error> {
+    let cache = Cache::new(
+        Some(config.cache_dir.as_path()),
+        Some(config.cache_dir.as_path()),
+        None,
+        None,
+    )
+    .map_err(|e| Error::Cache(e.to_string()))?;
+
+    let credentials = cache.credentials().ok_or(Error::NoCredentials)?;
+
+    // Fail before spawning if the backend is missing, so the caller gets a real error
+    // instead of a thread that dies on its own a moment later.
+    let backend = audio_backend::find(Some("http".to_string()))
+        .ok_or_else(|| Error::Backend("built without the http backend".to_string()))?;
+
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let thread = thread::Builder::new()
+        .name("librespot-embed".to_string())
+        .spawn(move || run(config, cache, credentials, backend, stop_rx))
+        .map_err(|e| Error::Session(e.to_string()))?;
+
+    Ok(Handle {
+        stop: Some(stop_tx),
+        thread: Some(thread),
+    })
+}
+
+fn run(
+    config: Config,
+    cache: Cache,
+    credentials: librespot_core::authentication::Credentials,
+    backend: audio_backend::SinkBuilder,
+    stop_rx: oneshot::Receiver<()>,
+) {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("could not start the runtime: {e}");
+            return;
+        }
+    };
+
+    runtime.block_on(async move {
+        let session = Session::new(SessionConfig::default(), Some(cache));
+
+        let player_config = PlayerConfig {
+            crossfade: std::time::Duration::from_secs(config.crossfade_secs),
+            ..Default::default()
+        };
+
+        let mixer = match SoftMixer::open(MixerConfig::default()) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                error!("could not open the mixer: {e}");
+                return;
+            }
+        };
+        let soft_volume = mixer.get_soft_volume();
+
+        // The http backend takes its bind address through the `device` argument, the same
+        // way every other backend names its output.
+        let device = Some(config.bind.clone());
+        let player = Player::new(player_config, session.clone(), soft_volume, move || {
+            (backend)(device, AudioFormat::S16)
+        });
+
+        #[cfg(feature = "cast")]
+        if let Some(target) = config.cast_to.clone() {
+            librespot_playback::cast::spawn(target, port_of(&config.bind));
+        }
+
+        let connect_config = ConnectConfig {
+            name: config.device_name.clone(),
+            ..Default::default()
+        };
+
+        let (spirc, spirc_task) =
+            match Spirc::new(connect_config, session.clone(), credentials, player, mixer).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!("could not initialize spirc: {e}");
+                    return;
+                }
+            };
+
+        info!("librespot-embed running as <{}>", config.device_name);
+
+        tokio::select! {
+            _ = spirc_task => info!("spirc task ended"),
+            _ = stop_rx => {
+                info!("stopping on request");
+                let _ = spirc.shutdown();
+            }
+        }
+
+        session.shutdown();
+    });
+}
+
+/// Port out of a bind address, falling back to the backend's own default.
+///
+/// Split from the right: an IPv6 literal such as `[::]:8321` has colons of its own, and
+/// splitting from the left would read the port as part of the address.
+fn port_of(bind: &str) -> u16 {
+    bind.rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(8321)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_port_out_of_a_bind_address() {
+        assert_eq!(port_of("0.0.0.0:8321"), 8321);
+        assert_eq!(port_of("192.168.1.89:9000"), 9000);
+    }
+
+    #[test]
+    fn an_ipv6_literal_does_not_confuse_the_port() {
+        // Splitting from the left would take "" or ":" here and silently fall back.
+        assert_eq!(port_of("[::]:8321"), 8321);
+        assert_eq!(port_of("[::1]:9000"), 9000);
+    }
+
+    #[test]
+    fn a_bind_address_with_no_port_falls_back() {
+        assert_eq!(port_of("0.0.0.0"), 8321);
+        assert_eq!(port_of(""), 8321);
+    }
+
+    #[test]
+    fn starting_without_credentials_says_so_instead_of_spawning() {
+        let dir = std::env::temp_dir().join("librespot-embed-no-creds-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join("credentials.json"));
+
+        match start(Config::new("test", &dir)) {
+            Err(Error::NoCredentials) => {}
+            Err(other) => panic!("expected NoCredentials, got {other}"),
+            Ok(_) => panic!("started with no credentials; the host cannot tell it is broken"),
+        }
+    }
+}

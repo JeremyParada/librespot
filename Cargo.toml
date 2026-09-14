@@ -28,6 +28,9 @@ include = [
     "CONTRIBUTING.md",
 ]
 
+[workspace]
+members = ["embed"]
+
 [workspace.package]
 rust-version = "1.85"
 authors = ["Librespot Org"]
