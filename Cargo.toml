@@ -98,7 +98,7 @@ sdl-backend = ["librespot-playback/sdl-backend"]
 alsa-backend = ["librespot-playback/alsa-backend"]
 http-backend = ["librespot-playback/http-backend"]
 # Point a Cast device or speaker group at the http backend automatically.
-cast = ["http-backend", "dep:rust_cast", "dep:mdns-sd"]
+cast = ["http-backend", "librespot-playback/cast"]
 
 # pulseaudio-backend: PulseAudio backend (Linux only).
 # Integrates with the PulseAudio sound server for advanced audio routing.
@@ -155,8 +155,6 @@ librespot-playback = { version = "0.8.0", path = "playback", default-features = 
 librespot-protocol = { version = "0.8.0", path = "protocol", default-features = false }
 
 [dependencies]
-rust_cast = { version = "0.21", optional = true }
-mdns-sd = { version = "0.21", optional = true }
 librespot-audio.workspace = true
 librespot-connect.workspace = true
 librespot-core.workspace = true

@@ -143,10 +143,11 @@ pub const BACKENDS: &[(&str, SinkBuilder)] = &[
     ("rodiojack", rodio::mk_rodiojack),
     #[cfg(feature = "sdl-backend")]
     (SdlSink::NAME, mk_sink::<SdlSink>),
-    #[cfg(feature = "http-backend")]
-    (HttpSink::NAME, mk_sink::<HttpSink>),
     (StdoutSink::NAME, mk_sink::<StdoutSink>),
     (SubprocessSink::NAME, mk_sink::<SubprocessSink>),
+    // Last on purpose: enabling a feature must not change which backend is the default.
+    #[cfg(feature = "http-backend")]
+    (HttpSink::NAME, mk_sink::<HttpSink>),
 ];
 
 pub fn find(name: Option<String>) -> Option<SinkBuilder> {

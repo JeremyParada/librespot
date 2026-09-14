@@ -6,6 +6,8 @@ use librespot_core as core;
 use librespot_metadata as metadata;
 
 pub mod audio_backend;
+#[cfg(feature = "cast")]
+pub mod cast;
 pub mod config;
 pub mod convert;
 pub mod decoder;

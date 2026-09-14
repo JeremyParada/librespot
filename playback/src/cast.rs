@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
-use librespot_playback::audio_backend::http::idle_for;
+use crate::audio_backend::http::idle_for;
 use log::{info, warn};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rust_cast::channels::media::{Media, StreamType};

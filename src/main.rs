@@ -38,8 +38,6 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
 
-#[cfg(feature = "cast")]
-mod cast;
 mod player_event_handler;
 use player_event_handler::{EventHandler, run_program_on_sink_events};
 
@@ -1638,7 +1636,7 @@ async fn get_setup() -> Setup {
                     .and_then(|d| d.rsplit_once(':'))
                     .and_then(|(_, p)| p.parse::<u16>().ok())
                     .unwrap_or(8321);
-                cast::spawn(target, port);
+                librespot_playback::cast::spawn(target, port);
             }
             #[cfg(not(feature = "cast"))]
             {
