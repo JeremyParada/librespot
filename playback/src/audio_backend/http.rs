@@ -28,8 +28,9 @@ use crate::decoder::AudioPacket;
 
 use std::io::Write;
 use std::process::exit;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,41 @@ const AHEAD_CHUNKS: usize = 8;
 
 /// Dropped if a client falls this far behind; a stalled socket must not stall the clock.
 const CLIENT_BACKLOG: usize = 64;
+
+/// When the player last produced audio, as milliseconds since the process started.
+///
+/// Exposed so a caster can release the Cast device once nothing has played for a while:
+/// holding a speaker group keeps it busy for everyone else in the house and pushes
+/// 1.4 Mbps of silence across the network for no reason.
+static LAST_AUDIO_MS: AtomicU64 = AtomicU64::new(0);
+
+fn epoch() -> &'static Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now)
+}
+
+fn mark_audio() {
+    // Never store 0: that is the "nothing has played yet" sentinel, and audio arriving
+    // within the first millisecond would otherwise read as never having played at all.
+    let ms = (epoch().elapsed().as_millis() as u64).max(1);
+    LAST_AUDIO_MS.store(ms, Ordering::Relaxed);
+}
+
+/// How long the player has produced nothing, or `None` if it never has.
+///
+/// "Never played" has to stay distinguishable from "played a moment ago": a caster
+/// waiting for something to play and a caster deciding when to let the device go want
+/// opposite answers for it, and collapsing both into a duration gets one of them wrong.
+pub fn idle_for() -> Option<Duration> {
+    match LAST_AUDIO_MS.load(Ordering::Relaxed) {
+        0 => None,
+        // saturating: the clock reading and the stored mark are taken at different
+        // instants, so "now" can legitimately be the earlier of the two.
+        last => Some(Duration::from_millis(
+            (epoch().elapsed().as_millis() as u64).saturating_sub(last),
+        )),
+    }
+}
 
 const DEFAULT_ADDR: &str = "0.0.0.0:8321";
 
@@ -132,7 +168,10 @@ fn run_sender(rx: Receiver<Vec<u8>>, hub: Hub) {
         next += period;
         let wait = next.saturating_duration_since(Instant::now());
         let chunk = match rx.recv_timeout(wait) {
-            Ok(pcm) => Arc::new(pcm),
+            Ok(pcm) => {
+                mark_audio();
+                Arc::new(pcm)
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => silence.clone(),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         };
@@ -205,6 +244,7 @@ impl Open for HttpSink {
             }
         };
 
+        let _ = epoch();
         let hub = Hub::default();
         let (tx, rx) = sync_channel(AHEAD_CHUNKS);
 
@@ -290,6 +330,19 @@ mod tests {
             hub.publish(Arc::new(vec![0u8; 4]));
         }
         assert_eq!(hub.0.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn never_played_is_not_the_same_as_played_just_now() {
+        // Collapsing these two into one duration is what made the caster grab the
+        // speakers at startup before anything had played.
+        assert_eq!(idle_for(), None, "nothing has played yet");
+
+        mark_audio();
+        assert!(
+            idle_for().is_some_and(|d| d < Duration::from_secs(1)),
+            "just-marked audio must read as active"
+        );
     }
 
     #[test]

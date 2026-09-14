@@ -13,6 +13,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
+use librespot_playback::audio_backend::http::idle_for;
 use log::{info, warn};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rust_cast::channels::media::{Media, StreamType};
@@ -25,6 +26,28 @@ const RECEIVER_ID: &str = "receiver-0";
 const SERVICE: &str = "_googlecast._tcp.local.";
 const DISCOVERY_WINDOW: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(15);
+
+/// Let the group go after this long with nothing playing.
+///
+/// Holding a Cast session keeps the speakers busy for everyone else in the house and
+/// pushes 1.4 Mbps of silence across the network around the clock. A short pause must
+/// still hold the session -- letting the stream dry up is what ends it -- so this is
+/// deliberately much longer than any pause a listener would take.
+const IDLE_RELEASE: Duration = Duration::from_secs(10 * 60);
+
+/// Below this, the player is considered to be producing audio right now.
+const ACTIVE_WITHIN: Duration = Duration::from_secs(5);
+
+const POLL: Duration = Duration::from_secs(2);
+
+/// Blocks until the player is producing audio, so nothing is cast before there is
+/// anything to listen to.
+fn wait_for_audio() {
+    // `None` means nothing has ever played, which is a reason to keep waiting.
+    while !idle_for().is_some_and(|d| d <= ACTIVE_WITHIN) {
+        thread::sleep(POLL);
+    }
+}
 
 /// What discovery found: the address to talk to, plus the name a human would recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +148,20 @@ fn attach(device: &Device, stream_port: u16) -> Result<(), Box<dyn std::error::E
 
     loop {
         match cast.receive() {
-            Ok(ChannelMessage::Heartbeat(_)) => cast.heartbeat.pong()?,
+            Ok(ChannelMessage::Heartbeat(_)) => {
+                cast.heartbeat.pong()?;
+                // The device pings every few seconds, which is a good enough clock to
+                // notice a long idle without polling anything ourselves.
+                if idle_for().is_some_and(|d| d >= IDLE_RELEASE) {
+                    info!(
+                        "Nothing played for {} min, releasing <{}>",
+                        IDLE_RELEASE.as_secs() / 60,
+                        device.name
+                    );
+                    let _ = cast.receiver.stop_app(app.session_id.as_str());
+                    return Ok(());
+                }
+            }
             Ok(_) => {}
             Err(e) => return Err(Box::new(e)),
         }
@@ -134,13 +170,17 @@ fn attach(device: &Device, stream_port: u16) -> Result<(), Box<dyn std::error::E
 
 fn run(target: String, stream_port: u16) {
     loop {
+        // Nothing is cast until there is audio, so a box that sits unused never takes
+        // the speakers away from anyone.
+        wait_for_audio();
         match discover() {
             Ok(found) => match pick(&found, &target) {
-                Some(device) => {
-                    if let Err(e) = attach(device, stream_port) {
-                        warn!("Cast session to <{target}> ended: {e}");
-                    }
-                }
+                Some(device) => match attach(device, stream_port) {
+                    // A clean return means it was released on purpose; loop straight
+                    // back to waiting for the next thing to play.
+                    Ok(()) => continue,
+                    Err(e) => warn!("Cast session to <{target}> ended: {e}"),
+                },
                 None => {
                     // Naming what *is* there turns "it does not work" into one glance,
                     // which matters most on a headless box with several groups.

@@ -116,7 +116,7 @@ mod sdl;
 use self::sdl::SdlSink;
 
 #[cfg(feature = "http-backend")]
-mod http;
+pub mod http;
 #[cfg(feature = "http-backend")]
 use self::http::HttpSink;
 
