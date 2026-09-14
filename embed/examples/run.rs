@@ -11,6 +11,6 @@ fn main() {
 
     let handle = librespot_embed::start(config).expect("start failed");
     println!("running; Ctrl+C to stop");
-    std::thread::sleep(std::time::Duration::from_secs(600));
+    std::thread::sleep(std::time::Duration::from_secs(3600));
     handle.stop();
 }
