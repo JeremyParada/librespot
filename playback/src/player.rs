@@ -1677,6 +1677,7 @@ impl Future for PlayerInternal {
                 .crossfade
                 .as_millis()
                 .min(u32::MAX as u128) as u32;
+            if crossfade_ms > 0
                 && !passthrough
                 && self.crossfade.is_none()
                 && matches!(self.preload, PlayerPreload::Ready { .. })
