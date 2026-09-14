@@ -38,6 +38,8 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
 
+#[cfg(feature = "cast")]
+mod cast;
 mod player_event_handler;
 use player_event_handler::{EventHandler, run_program_on_sink_events};
 
@@ -242,6 +244,7 @@ async fn get_setup() -> Setup {
     const CACHE: &str = "cache";
     const CACHE_SIZE_LIMIT: &str = "cache-size-limit";
     const CROSSFADE: &str = "crossfade";
+    const CAST_TO: &str = "cast-to";
     const DEVICE: &str = "device";
     const DEVICE_TYPE: &str = "device-type";
     const DEVICE_IS_GROUP: &str = "group";
@@ -465,6 +468,13 @@ async fn get_setup() -> Setup {
         CROSSFADE,
         "Overlap consecutive tracks by SECONDS (0 - 12). Defaults to 0 (off).",
         "SECONDS",
+    )
+    .optopt(
+        "",
+        CAST_TO,
+        "Cast the http backend's stream to the Cast device or speaker group with this exact \
+         name, retrying until it appears. Names come from the Google Home app.",
+        "NAME",
     )
     .optopt(
         FORMAT_SHORT,
@@ -1618,6 +1628,24 @@ async fn get_setup() -> Setup {
                 })
             })
             .unwrap_or(player_default_config.bitrate);
+
+        if let Some(target) = opt_str(CAST_TO) {
+            // El puerto del stream sale del mismo --device que usa el backend http.
+            #[cfg(feature = "cast")]
+            {
+                let port = opt_str(DEVICE)
+                    .as_deref()
+                    .and_then(|d| d.rsplit_once(':'))
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .unwrap_or(8321);
+                cast::spawn(target, port);
+            }
+            #[cfg(not(feature = "cast"))]
+            {
+                let _ = target;
+                warn!("--{CAST_TO} needs the `cast` feature; this build ignores it");
+            }
+        }
 
         let crossfade = opt_str(CROSSFADE)
             .map(|seconds| match seconds.parse::<f64>() {
