@@ -1680,7 +1680,7 @@ impl Future for PlayerInternal {
                 && matches!(self.state,
                     PlayerState::Playing { duration_ms, stream_position_ms, .. }
                         if duration_ms > crossfade_ms
-                            && duration_ms - stream_position_ms <= crossfade_ms)
+                            && duration_ms.saturating_sub(stream_position_ms) <= crossfade_ms)
             {
                 self.begin_crossfade();
             }
