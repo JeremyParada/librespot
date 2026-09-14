@@ -115,3 +115,50 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeStop(_env: JNIEn
         info!("stopped");
     }
 }
+
+/// Starts a device sign-in and returns "CODE|URL" to display, or an empty string if it
+/// could not even be started.
+///
+/// Credentials are minted on the device on purpose. Copying them from a desktop looks
+/// like it works -- the session authenticates -- and then Spirc is rejected, because the
+/// stored blob is tied to the client id of the machine that created it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_librespot_embed_Librespot_nativeAuthBegin<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    cache_dir: JString,
+) -> JString<'a> {
+    init_logging();
+
+    // Built first and reused: handing back an empty string is the failure signal, and
+    // building it later would need `env` while it is already borrowed.
+    let out = match take_string(&mut env, &cache_dir) {
+        None => {
+            error!("could not read the cache dir from the JVM");
+            String::new()
+        }
+        Some(cache_dir) => {
+            match crate::begin_device_auth(Config::new("Crossfade Bridge", cache_dir)) {
+                Ok(auth) => {
+                    info!("pair at {} with code {}", auth.url, auth.code);
+                    format!("{}|{}", auth.code, auth.url)
+                }
+                Err(e) => {
+                    error!("could not begin device auth: {e}");
+                    String::new()
+                }
+            }
+        }
+    };
+
+    env.new_string(out).unwrap_or_else(|_| JString::default())
+}
+
+/// 0 idle, 1 waiting for the user, 2 done, 3 failed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_librespot_embed_Librespot_nativeAuthStatus(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    crate::auth_status() as jint
+}

@@ -16,8 +16,14 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 librespot-core = { workspace = true }
 librespot-connect = { workspace = true }
+librespot-oauth = { workspace = true }
 librespot-playback = { workspace = true }
+data-encoding = "2"
 log = "0.4"
+sha1 = "0.10"
+# Para elegir proveedor criptografico explicitamente: el arbol trae mas de uno y
+# rustls se niega a adivinar.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -29,6 +35,6 @@ env_logger = "0.11"
 
 [features]
 default = []
-native-tls = ["librespot-core/native-tls"]
-rustls-tls-webpki-roots = ["librespot-core/rustls-tls-webpki-roots"]
+native-tls = ["librespot-core/native-tls", "librespot-oauth/native-tls"]
+rustls-tls-webpki-roots = ["librespot-core/rustls-tls-webpki-roots", "librespot-oauth/rustls-tls-webpki-roots"]
 cast = ["librespot-playback/cast"]

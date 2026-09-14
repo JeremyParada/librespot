@@ -2054,12 +2054,16 @@ name = "librespot-embed"
 version = "0.8.0"
 dependencies = [
  "android_logger",
+ "data-encoding",
  "env_logger",
  "jni",
  "librespot-connect",
  "librespot-core",
+ "librespot-oauth",
  "librespot-playback",
  "log",
+ "rustls 0.23.35",
+ "sha1",
  "tokio",
 ]
 

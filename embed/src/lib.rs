@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 
 use librespot_connect::{ConnectConfig, Spirc};
@@ -23,6 +24,180 @@ use librespot_playback::mixer::{Mixer, MixerConfig};
 use librespot_playback::player::Player;
 use log::{error, info};
 use tokio::sync::oneshot;
+
+/// The exact scope list the CLI requests. Trimming it to what seems necessary gets
+/// the whole request rejected with `invalid_scope`, not a narrower grant.
+const OAUTH_SCOPES: &[&str] = &[
+    "app-remote-control",
+    "playlist-modify",
+    "playlist-modify-private",
+    "playlist-modify-public",
+    "playlist-read",
+    "playlist-read-collaborative",
+    "playlist-read-private",
+    "streaming",
+    "ugc-image-upload",
+    "user-follow-modify",
+    "user-follow-read",
+    "user-library-modify",
+    "user-library-read",
+    "user-modify",
+    "user-modify-playback-state",
+    "user-modify-private",
+    "user-personalized",
+    "user-read-birthdate",
+    "user-read-currently-playing",
+    "user-read-email",
+    "user-read-play-history",
+    "user-read-playback-position",
+    "user-read-playback-state",
+    "user-read-private",
+    "user-read-recently-played",
+    "user-top-read",
+];
+
+/// librespot's own client id, from librespot-core/src/config.rs where it is `pub(crate)`.
+///
+/// `SessionConfig::default()` picks one per operating system, which on Android means the
+/// official Spotify app's id -- and that client does not carry the scopes librespot asks
+/// for, so device auth is refused outright with `invalid_scope`. Using the same id the
+/// desktop CLI uses, on every host, keeps minting and spending credentials consistent.
+const CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+
+/// One-time setup every entry point needs.
+///
+/// More than one rustls crypto provider ends up in the tree -- librespot brings one and
+/// the caster another -- and rustls refuses to guess between them, panicking on first use
+/// deep inside whatever happened to call it. Choosing once, here, turns that into a
+/// decision instead of a crash. Every public entry point must call this: the sign-in path
+/// reaches TLS without going anywhere near `start`.
+fn init() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+/// A session config that does not vary with the host operating system.
+fn session_config() -> SessionConfig {
+    SessionConfig {
+        client_id: CLIENT_ID.to_string(),
+        ..Default::default()
+    }
+}
+
+/// 0 idle, 1 waiting for the user, 2 done, 3 failed.
+static AUTH_STATE: AtomicU8 = AtomicU8::new(0);
+
+pub const AUTH_IDLE: u8 = 0;
+pub const AUTH_PENDING: u8 = 1;
+pub const AUTH_DONE: u8 = 2;
+pub const AUTH_FAILED: u8 = 3;
+
+/// What to show the person so they can approve this device.
+#[derive(Debug, Clone)]
+pub struct DeviceAuth {
+    pub code: String,
+    pub url: String,
+}
+
+/// Progress of the sign-in started by [`begin_device_auth`].
+pub fn auth_status() -> u8 {
+    AUTH_STATE.load(Ordering::Relaxed)
+}
+
+/// Starts a device sign-in and returns the code to display.
+///
+/// Minting the credentials here rather than copying them from a desktop is the whole
+/// point: stored credentials are tied to the client id that obtained them, and that id
+/// is chosen per operating system. Credentials made on Windows authenticate the session
+/// on Android and are then rejected by `login5`, which Spirc calls immediately after --
+/// an error that reads like a wrong password and is nothing of the sort.
+pub fn begin_device_auth(config: Config) -> Result<DeviceAuth, Error> {
+    use librespot_oauth::DeviceAuthClientBuilder;
+
+    init();
+
+    let client = DeviceAuthClientBuilder::new(CLIENT_ID, OAUTH_SCOPES.to_vec())
+        .build()
+        .map_err(|e| Error::Session(e.to_string()))?;
+
+    let auth = client
+        .request_device_code()
+        .map_err(|e| Error::Session(e.to_string()))?;
+    let shown = DeviceAuth {
+        code: auth.user_code().to_string(),
+        url: auth.url().to_string(),
+    };
+
+    AUTH_STATE.store(AUTH_PENDING, Ordering::Relaxed);
+    thread::spawn(move || {
+        // Polling blocks until the person approves or the code expires.
+        let token = match client.poll_for_token(&auth) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("device auth failed: {e}");
+                AUTH_STATE.store(AUTH_FAILED, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        // Connecting once with the access token is what makes the session write reusable
+        // credentials into the cache; the token itself is short-lived and no use later.
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("could not start the runtime: {e}");
+                AUTH_STATE.store(AUTH_FAILED, Ordering::Relaxed);
+                return;
+            }
+        };
+        let ok = runtime.block_on(async move {
+            let cache = match Cache::new(
+                Some(config.cache_dir.as_path()),
+                Some(config.cache_dir.as_path()),
+                None,
+                None,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("cache: {e}");
+                    return false;
+                }
+            };
+            let session = Session::new(session_config(), Some(cache));
+            match session
+                .connect(
+                    librespot_core::authentication::Credentials::with_access_token(
+                        token.access_token,
+                    ),
+                    true,
+                )
+                .await
+            {
+                Ok(()) => {
+                    session.shutdown();
+                    true
+                }
+                Err(e) => {
+                    error!("could not store credentials: {e}");
+                    false
+                }
+            }
+        });
+
+        AUTH_STATE.store(if ok { AUTH_DONE } else { AUTH_FAILED }, Ordering::Relaxed);
+        if ok {
+            info!("device authorised; credentials stored");
+        }
+    });
+
+    Ok(shown)
+}
 
 #[cfg(target_os = "android")]
 mod jni_bridge;
@@ -105,6 +280,8 @@ impl Handle {
 /// Returns early with [`Error::NoCredentials`] rather than starting a doomed worker, so a
 /// host can tell "not signed in yet" apart from "running".
 pub fn start(config: Config) -> Result<Handle, Error> {
+    init();
+
     let cache = Cache::new(
         Some(config.cache_dir.as_path()),
         Some(config.cache_dir.as_path()),
@@ -151,7 +328,7 @@ fn run(
     };
 
     runtime.block_on(async move {
-        let session = Session::new(SessionConfig::default(), Some(cache));
+        let session = Session::new(session_config(), Some(cache));
 
         let player_config = PlayerConfig {
             crossfade: std::time::Duration::from_secs(config.crossfade_secs),
