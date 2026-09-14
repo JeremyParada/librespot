@@ -96,6 +96,7 @@ sdl-backend = ["librespot-playback/sdl-backend"]
 # alsa-backend: Advanced Linux Sound Architecture backend (Linux only).
 # Provides low-latency audio output on Linux systems.
 alsa-backend = ["librespot-playback/alsa-backend"]
+http-backend = ["librespot-playback/http-backend"]
 
 # pulseaudio-backend: PulseAudio backend (Linux only).
 # Integrates with the PulseAudio sound server for advanced audio routing.

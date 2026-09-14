@@ -115,6 +115,11 @@ mod sdl;
 #[cfg(feature = "sdl-backend")]
 use self::sdl::SdlSink;
 
+#[cfg(feature = "http-backend")]
+mod http;
+#[cfg(feature = "http-backend")]
+use self::http::HttpSink;
+
 mod pipe;
 use self::pipe::StdoutSink;
 
@@ -138,6 +143,8 @@ pub const BACKENDS: &[(&str, SinkBuilder)] = &[
     ("rodiojack", rodio::mk_rodiojack),
     #[cfg(feature = "sdl-backend")]
     (SdlSink::NAME, mk_sink::<SdlSink>),
+    #[cfg(feature = "http-backend")]
+    (HttpSink::NAME, mk_sink::<HttpSink>),
     (StdoutSink::NAME, mk_sink::<StdoutSink>),
     (SubprocessSink::NAME, mk_sink::<SubprocessSink>),
 ];

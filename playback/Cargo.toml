@@ -14,6 +14,8 @@ default = ["rodio-backend", "native-tls"]
 
 # Audio backends
 alsa-backend = ["dep:alsa"]
+# Serves the decoded stream over HTTP as LPCM/WAV, for Google Cast receivers.
+http-backend = []
 gstreamer-backend = [
     "dep:gstreamer",
     "dep:gstreamer-app",
