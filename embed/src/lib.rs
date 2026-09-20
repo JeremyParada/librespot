@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::{Session, SessionConfig, cache::Cache};
@@ -281,6 +282,11 @@ impl Handle {
 
     /// Stops playback and waits for the worker to wind down.
     pub fn stop(mut self) {
+        // Before the worker goes: a caster left running would keep the speakers and
+        // fight whatever starts next for them.
+        #[cfg(feature = "cast")]
+        librespot_playback::cast::release();
+
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -312,16 +318,48 @@ pub fn start(config: Config) -> Result<Handle, Error> {
     let backend = audio_backend::find(Some("http".to_string()))
         .ok_or_else(|| Error::Backend("built without the http backend".to_string()))?;
 
+    let port = port_of(&config.bind);
     let (stop_tx, stop_rx) = oneshot::channel();
     let thread = thread::Builder::new()
         .name("librespot-embed".to_string())
         .spawn(move || run(config, cache, credentials, backend, stop_rx))
         .map_err(|e| Error::Session(e.to_string()))?;
 
-    Ok(Handle {
+    let handle = Handle {
         stop: Some(stop_tx),
         thread: Some(thread),
-    })
+    };
+
+    // Returning before the stream exists would be a lie the host has no way to catch:
+    // the player builds its sink on its own thread, so a port that is still taken kills
+    // that thread quietly and everything upstream goes on claiming to play.
+    if !wait_until_serving(port, &handle) {
+        handle.stop();
+        return Err(Error::Backend(format!(
+            "nothing is being served on port {port}; is it already in use?"
+        )));
+    }
+
+    Ok(handle)
+}
+
+/// How long to give the player to get its sink open.
+const SERVING_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVING_POLL: Duration = Duration::from_millis(50);
+
+/// Whether the stream came up on `port` before the worker gave up or time ran out.
+fn wait_until_serving(port: u16, handle: &Handle) -> bool {
+    let deadline = Instant::now() + SERVING_TIMEOUT;
+    while Instant::now() < deadline {
+        if librespot_playback::audio_backend::http::serving_port() == Some(port) {
+            return true;
+        }
+        if handle.is_finished() {
+            return false;
+        }
+        thread::sleep(SERVING_POLL);
+    }
+    false
 }
 
 fn run(

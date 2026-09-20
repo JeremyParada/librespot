@@ -9,6 +9,8 @@
 //! coin flip, and the failure is music starting in the wrong room.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,11 +49,15 @@ const DEAD_SESSION: Duration = Duration::from_secs(20);
 
 /// Blocks until the player is producing audio, so nothing is cast before there is
 /// anything to listen to.
-fn wait_for_audio() {
+fn wait_for_audio(state: &AtomicU8) -> bool {
     // `None` means nothing has ever played, which is a reason to keep waiting.
     while !idle_for().is_some_and(|d| d <= ACTIVE_WITHIN) {
+        if winding(state).is_some() {
+            return false;
+        }
         thread::sleep(POLL);
     }
+    true
 }
 
 /// What discovery found: the address to talk to, plus the name a human would recognise.
@@ -181,7 +187,11 @@ fn session_is_dead(
 }
 
 /// Casts once and stays attached until the connection drops, answering heartbeats.
-fn attach(device: &Device, stream_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+fn attach(
+    device: &Device,
+    stream_port: u16,
+    state: &AtomicU8,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ip = local_ip_towards(&device.host, device.port)
         .ok_or("could not work out which local address this device can reach")?;
     let url = format!("http://{ip}:{stream_port}/");
@@ -216,6 +226,21 @@ fn attach(device: &Device, stream_port: u16) -> Result<(), Box<dyn std::error::E
         match cast.receive() {
             Ok(ChannelMessage::Heartbeat(_)) => {
                 cast.heartbeat.pong()?;
+
+                // The only place this loop is free to look: `receive` blocks, and the
+                // device pings every few seconds.
+                match winding(state) {
+                    Some(Winding::Release) => {
+                        info!("Released <{}>", device.name);
+                        let _ = cast.receiver.stop_app(app.session_id.as_str());
+                        return Ok(());
+                    }
+                    Some(Winding::Superseded) => {
+                        info!("Another caster took over <{}>", device.name);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
 
                 // A receiver can stop playing while this connection stays up and keeps
                 // answering heartbeats: on a Chromecast the system kills its own
@@ -254,14 +279,19 @@ fn attach(device: &Device, stream_port: u16) -> Result<(), Box<dyn std::error::E
     }
 }
 
-fn run(target: String, stream_port: u16) {
+fn run(target: String, stream_port: u16, state: Arc<AtomicU8>) {
     loop {
+        if winding(&state).is_some() {
+            return;
+        }
         // Nothing is cast until there is audio, so a box that sits unused never takes
         // the speakers away from anyone.
-        wait_for_audio();
+        if !wait_for_audio(&state) {
+            return;
+        }
         match discover() {
             Ok(found) => match pick(&found, &target) {
-                Some(device) => match attach(device, stream_port) {
+                Some(device) => match attach(device, stream_port, &state) {
                     // A clean return means it was released on purpose; loop straight
                     // back to waiting for the next thing to play.
                     Ok(()) => continue,
@@ -283,14 +313,74 @@ fn run(target: String, stream_port: u16) {
             },
             Err(e) => warn!("Cast discovery failed: {e}"),
         }
-        thread::sleep(RETRY_DELAY);
+        if !sleep_unless_winding(&state, RETRY_DELAY) {
+            return;
+        }
     }
 }
 
 /// Starts casting in the background. Never blocks startup: if the group is off or the
 /// network is not up yet, it keeps retrying while the stream stays served.
+/// Why a caster is winding down, which decides whether it lets go of the group.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Winding {
+    /// Still going.
+    No = 0,
+    /// The host stopped playback: let the group go, so the speakers are free.
+    Release = 1,
+    /// Another caster took over. Leave the receiver alone -- stopping the app here
+    /// would kill the session the new caster has just set up on the same group.
+    Superseded = 2,
+}
+
+/// The caster that is allowed to drive the group.
+///
+/// A static because a caster cannot be handed back to the host: `spawn` is called from
+/// deep inside startup, and an embedder that starts and stops repeatedly would otherwise
+/// leave one thread per start, all fighting over the same speakers.
+static CURRENT: Mutex<Option<Arc<AtomicU8>>> = Mutex::new(None);
+
+/// Starts casting, and stops whatever was casting before.
 pub fn spawn(target: String, stream_port: u16) {
-    thread::spawn(move || run(target, stream_port));
+    let state = Arc::new(AtomicU8::new(Winding::No as u8));
+
+    if let Ok(mut current) = CURRENT.lock() {
+        if let Some(previous) = current.replace(state.clone()) {
+            previous.store(Winding::Superseded as u8, Ordering::Relaxed);
+        }
+    }
+
+    thread::spawn(move || run(target, stream_port, state));
+}
+
+/// Lets the group go. Safe to call when nothing is casting.
+pub fn release() {
+    if let Ok(mut current) = CURRENT.lock() {
+        if let Some(state) = current.take() {
+            state.store(Winding::Release as u8, Ordering::Relaxed);
+        }
+    }
+}
+
+fn winding(state: &AtomicU8) -> Option<Winding> {
+    match state.load(Ordering::Relaxed) {
+        1 => Some(Winding::Release),
+        2 => Some(Winding::Superseded),
+        _ => None,
+    }
+}
+
+/// Sleeps in small steps so a caster that has been told to stop does not keep the group
+/// for the rest of a long wait.
+fn sleep_unless_winding(state: &AtomicU8, total: Duration) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if winding(state).is_some() {
+            return false;
+        }
+        thread::sleep(POLL.min(deadline - Instant::now()));
+    }
+    true
 }
 
 #[cfg(test)]

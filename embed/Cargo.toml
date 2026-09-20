@@ -17,7 +17,10 @@ crate-type = ["lib", "cdylib"]
 librespot-core = { workspace = true }
 librespot-connect = { workspace = true }
 librespot-oauth = { workspace = true }
-librespot-playback = { workspace = true }
+# The http backend is not optional here: it is the only output this crate has, and
+# `start` now waits on the port it serves, so its absence is a compile error rather
+# than a crate that builds and then refuses to play.
+librespot-playback = { workspace = true, features = ["http-backend"] }
 data-encoding = "2"
 log = "0.4"
 sha1 = "0.10"

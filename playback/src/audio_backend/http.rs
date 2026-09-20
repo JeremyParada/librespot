@@ -27,7 +27,7 @@ use crate::convert::Converter;
 use crate::decoder::AudioPacket;
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -54,6 +54,10 @@ const CLIENT_BACKLOG: usize = 64;
 /// How often the accept loop looks at its stop flag. Only bounds shutdown latency.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
+/// How long a bind keeps trying. Covers a previous instance on its way out, and no more:
+/// past this, the port really does belong to somebody else.
+const BIND_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// When the player last produced audio, as milliseconds since the process started.
 ///
 /// Exposed so a caster can release the Cast device once nothing has played for a while:
@@ -71,6 +75,21 @@ fn mark_audio() {
     // within the first millisecond would otherwise read as never having played at all.
     let ms = (epoch().elapsed().as_millis() as u64).max(1);
     LAST_AUDIO_MS.store(ms, Ordering::Relaxed);
+}
+
+/// The port the stream is on, or 0 when nothing is being served.
+static SERVING: AtomicU16 = AtomicU16::new(0);
+
+/// The port the stream is actually being served on.
+///
+/// A host can be told the bridge started before this backend has even tried to bind,
+/// because the player builds its sink on its own thread; a failure there kills that
+/// thread and leaves the host claiming to play. This is the proof that it is not.
+pub fn serving_port() -> Option<u16> {
+    match SERVING.load(Ordering::Relaxed) {
+        0 => None,
+        port => Some(port),
+    }
 }
 
 /// How many clients are pulling the stream right now.
@@ -211,6 +230,22 @@ fn run_sender(rx: Receiver<Vec<u8>>, hub: Hub) {
     }
 }
 
+/// Binds, giving a previous instance a moment to let go of the port.
+///
+/// Stopping does not free the port instantly: the accept loop only notices on its next
+/// poll. A host that stops and starts back to back would otherwise hit its own listener
+/// on the way out, which reads like "the port is taken by something else" and is not.
+fn bind_with_retry(addr: &str) -> std::io::Result<std::net::TcpListener> {
+    let deadline = Instant::now() + BIND_TIMEOUT;
+    loop {
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => return Ok(listener),
+            Err(e) if Instant::now() >= deadline => return Err(e),
+            Err(_) => thread::sleep(ACCEPT_POLL),
+        }
+    }
+}
+
 /// Accepts until `stop` is set, then lets the listener close.
 ///
 /// Polled rather than blocked on `accept`, because closing a listener another thread is
@@ -281,6 +316,7 @@ impl Drop for HttpSink {
     /// stops and starts again finds its own address already in use.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        SERVING.store(0, Ordering::Relaxed);
     }
 }
 
@@ -301,7 +337,7 @@ impl Open for HttpSink {
             panic!("{e}");
         }
 
-        let listener = match std::net::TcpListener::bind(&addr) {
+        let listener = match bind_with_retry(&addr) {
             Ok(l) => l,
             Err(e) => {
                 let e = HttpError::BindFailure {
@@ -312,6 +348,13 @@ impl Open for HttpSink {
                 panic!("{e}");
             }
         };
+
+        // Announced from the address the OS settled on, so a `:0` bind reports the port
+        // it was actually given rather than zero.
+        match listener.local_addr() {
+            Ok(bound) => SERVING.store(bound.port(), Ordering::Relaxed),
+            Err(e) => error!("<HttpSink> bound but cannot name the port: {e}"),
+        }
 
         let _ = epoch();
         let hub = Hub::default();
