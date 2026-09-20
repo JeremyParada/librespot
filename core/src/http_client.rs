@@ -28,7 +28,7 @@ use hyper_tls::HttpsConnector;
 
 use crate::{
     Error,
-    config::{OS, os_version},
+    config::{os, os_version},
     date::Date,
     version::{FALLBACK_USER_AGENT, VERSION_STRING, spotify_version},
 };
@@ -108,7 +108,7 @@ impl HttpClient {
         let zero_str = String::from("0");
         let os_version = os_version();
 
-        let (spotify_platform, os_version) = match OS {
+        let (spotify_platform, os_version) = match os() {
             "android" => ("Android", os_version),
             "ios" => ("iOS", os_version),
             "macos" => ("OSX", zero_str),
@@ -124,6 +124,9 @@ impl HttpClient {
             VERSION_STRING
         );
 
+        // Logged because a wrong platform or version here is rejected far away from its
+        // cause: the access point accepts the session and login5 then fails BAD_REQUEST.
+        debug!("User agent: {user_agent_str}");
         let user_agent = HeaderValue::from_str(user_agent_str).unwrap_or_else(|err| {
             error!("Invalid user agent <{user_agent_str}>: {err}");
             HeaderValue::from_static(FALLBACK_USER_AGENT)

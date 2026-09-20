@@ -76,6 +76,11 @@ fn init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Announce the same platform the credentials were minted for. CLIENT_ID below is
+        // the desktop CLI's, and login5 denies a stored credential whose client id does
+        // not match the platform asking -- BAD_REQUEST, right after the access point has
+        // already said the session is fine.
+        librespot_core::config::set_os("linux");
     });
 }
 
@@ -214,6 +219,9 @@ pub struct Config {
     pub cast_to: Option<String>,
     /// Seconds of overlap between tracks; 0 disables it.
     pub crossfade_secs: u64,
+    /// Crossfade consecutive tracks of the same album too, instead of leaving them
+    /// gapless.
+    pub crossfade_albums: bool,
     /// Directory holding the credentials written by a previous OAuth sign-in.
     pub cache_dir: PathBuf,
 }
@@ -225,6 +233,7 @@ impl Config {
             bind: "0.0.0.0:8321".to_string(),
             cast_to: None,
             crossfade_secs: 0,
+            crossfade_albums: false,
             cache_dir: cache_dir.into(),
         }
     }
@@ -264,6 +273,12 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Whether the worker has already ended on its own, which means it failed: the
+    /// normal way out is [`Handle::stop`].
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| t.is_finished())
+    }
+
     /// Stops playback and waits for the worker to wind down.
     pub fn stop(mut self) {
         if let Some(stop) = self.stop.take() {
@@ -332,6 +347,7 @@ fn run(
 
         let player_config = PlayerConfig {
             crossfade: std::time::Duration::from_secs(config.crossfade_secs),
+            crossfade_albums: config.crossfade_albums,
             ..Default::default()
         };
 
@@ -342,7 +358,19 @@ fn run(
                 return;
             }
         };
-        let soft_volume = mixer.get_soft_volume();
+        // Casting to a group hands the volume to that group, so nothing is attenuated
+        // here. Doing both multiplies two attenuations -- Spotify's slider at 45% is
+        // already -33 dB on librespot's 60 dB log curve, and the group's own level lands
+        // on top of it -- and every dB taken in software is resolution the speakers never
+        // get. Spotify's slider stops doing anything while casting, by design: the volume
+        // lives where the speakers are.
+        let soft_volume: Box<dyn librespot_playback::mixer::VolumeGetter + Send> =
+            if config.cast_to.is_some() {
+                info!("casting: leaving the volume to the group");
+                Box::new(librespot_playback::mixer::NoOpVolume)
+            } else {
+                mixer.get_soft_volume()
+            };
 
         // The http backend takes its bind address through the `device` argument, the same
         // way every other backend names its output.

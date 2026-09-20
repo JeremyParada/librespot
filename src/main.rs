@@ -242,6 +242,7 @@ async fn get_setup() -> Setup {
     const CACHE: &str = "cache";
     const CACHE_SIZE_LIMIT: &str = "cache-size-limit";
     const CROSSFADE: &str = "crossfade";
+    const CROSSFADE_ALBUMS: &str = "crossfade-albums";
     const CAST_TO: &str = "cast-to";
     const DEVICE: &str = "device";
     const DEVICE_TYPE: &str = "device-type";
@@ -466,6 +467,11 @@ async fn get_setup() -> Setup {
         CROSSFADE,
         "Overlap consecutive tracks by SECONDS (0 - 12). Defaults to 0 (off).",
         "SECONDS",
+    )
+    .optflag(
+        "",
+        CROSSFADE_ALBUMS,
+        "Crossfade consecutive tracks of the same album too, which is left gapless by default.",
     )
     .optopt(
         "",
@@ -1664,6 +1670,14 @@ async fn get_setup() -> Setup {
             })
             .unwrap_or(player_default_config.crossfade);
 
+        // Consecutive album tracks are left gapless unless asked otherwise: an album's own
+        // mastering already handles those joins, and overlapping them fights the record.
+        let crossfade_albums = opt_present(CROSSFADE_ALBUMS);
+
+        if crossfade_albums && crossfade.is_zero() {
+            warn!("`--{CROSSFADE_ALBUMS}` does nothing without `--{CROSSFADE}`");
+        }
+
         // Crossfading is gapless by definition: stopping the sink between tracks would cut the
         // outgoing one dead halfway through its fade.
         let gapless = !opt_present(DISABLE_GAPLESS) || !crossfade.is_zero();
@@ -1912,6 +1926,7 @@ async fn get_setup() -> Setup {
             gapless,
             passthrough,
             crossfade,
+            crossfade_albums,
             normalisation,
             normalisation_type,
             normalisation_method,

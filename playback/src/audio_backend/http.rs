@@ -27,8 +27,7 @@ use crate::convert::Converter;
 use crate::decoder::AudioPacket;
 
 use std::io::Write;
-use std::process::exit;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -52,6 +51,9 @@ const AHEAD_CHUNKS: usize = 8;
 /// Dropped if a client falls this far behind; a stalled socket must not stall the clock.
 const CLIENT_BACKLOG: usize = 64;
 
+/// How often the accept loop looks at its stop flag. Only bounds shutdown latency.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
 /// When the player last produced audio, as milliseconds since the process started.
 ///
 /// Exposed so a caster can release the Cast device once nothing has played for a while:
@@ -69,6 +71,33 @@ fn mark_audio() {
     // within the first millisecond would otherwise read as never having played at all.
     let ms = (epoch().elapsed().as_millis() as u64).max(1);
     LAST_AUDIO_MS.store(ms, Ordering::Relaxed);
+}
+
+/// How many clients are pulling the stream right now.
+static LISTENERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of clients currently being served.
+///
+/// A caster uses this to tell a live session from a dead one: a Cast receiver that goes
+/// away stops reading, and on some devices nothing else says so.
+pub fn listeners() -> usize {
+    LISTENERS.load(Ordering::Relaxed)
+}
+
+/// Counts one listener for as long as it lives, however the serving loop ends.
+struct Listener;
+
+impl Listener {
+    fn new() -> Self {
+        LISTENERS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        LISTENERS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// How long the player has produced nothing, or `None` if it never has.
@@ -182,10 +211,37 @@ fn run_sender(rx: Receiver<Vec<u8>>, hub: Hub) {
     }
 }
 
-fn run_server(listener: std::net::TcpListener, hub: Hub) {
-    for stream in listener.incoming().flatten() {
-        let hub = hub.clone();
-        thread::spawn(move || serve_client(stream, hub));
+/// Accepts until `stop` is set, then lets the listener close.
+///
+/// Polled rather than blocked on `accept`, because closing a listener another thread is
+/// parked inside needs the raw fd. The wait only delays shutdown: a Cast receiver
+/// connects once, at the start, and is never waiting on this.
+fn run_server(listener: std::net::TcpListener, hub: Hub, stop: Arc<AtomicBool>) {
+    if let Err(e) = listener.set_nonblocking(true) {
+        error!("<HttpSink> could not poll the listener, it will stay up: {e}");
+        for stream in listener.incoming().flatten() {
+            let hub = hub.clone();
+            thread::spawn(move || serve_client(stream, hub));
+        }
+        return;
+    }
+
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Back to blocking: only accepting is polled, serving is not.
+                let _ = stream.set_nonblocking(false);
+                let hub = hub.clone();
+                thread::spawn(move || serve_client(stream, hub));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL);
+            }
+            Err(e) => {
+                error!("<HttpSink> stopped accepting connections: {e}");
+                return;
+            }
+        }
     }
 }
 
@@ -201,6 +257,7 @@ fn serve_client(mut stream: std::net::TcpStream, hub: Hub) {
     if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&wav_header()).is_err() {
         return;
     }
+    let _counted = Listener::new();
     let rx = hub.subscribe();
     while let Ok(chunk) = rx.recv() {
         if stream.write_all(&chunk).is_err() {
@@ -215,6 +272,16 @@ pub struct HttpSink {
     tx: Option<SyncSender<Vec<u8>>>,
     /// `write_bytes` is handed arbitrary lengths; the clock wants fixed chunks.
     pending: Vec<u8>,
+    /// Tells the accept loop to let go of the port when this sink is dropped.
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for HttpSink {
+    /// Frees the port. Without this the listener outlives the sink, and an embedder that
+    /// stops and starts again finds its own address already in use.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Open for HttpSink {
@@ -225,22 +292,24 @@ impl Open for HttpSink {
     fn open(device: Option<String>, format: AudioFormat) -> Self {
         let addr = device.unwrap_or_else(|| DEFAULT_ADDR.to_string());
 
+        // Panics instead of exiting: this backend also runs inside someone else's
+        // process, where `exit` runs the whole program's static destructors and brings
+        // the host down with it -- on Android as a SIGABRT in an unrelated thread.
         if format != AudioFormat::S16 {
-            error!("{}", HttpError::UnsupportedFormat(format));
-            exit(1);
+            let e = HttpError::UnsupportedFormat(format);
+            error!("{e}");
+            panic!("{e}");
         }
 
         let listener = match std::net::TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
-                error!(
-                    "{}",
-                    HttpError::BindFailure {
-                        addr: addr.clone(),
-                        e
-                    }
-                );
-                exit(1);
+                let e = HttpError::BindFailure {
+                    addr: addr.clone(),
+                    e,
+                };
+                error!("{e}");
+                panic!("{e}");
             }
         };
 
@@ -252,9 +321,11 @@ impl Open for HttpSink {
             let hub = hub.clone();
             move || run_sender(rx, hub)
         });
+        let stop = Arc::new(AtomicBool::new(false));
         thread::spawn({
             let hub = hub.clone();
-            move || run_server(listener, hub)
+            let stop = stop.clone();
+            move || run_server(listener, hub, stop)
         });
 
         info!("Using HttpSink with format: {format:?}, serving WAV on http://{addr}/");
@@ -263,6 +334,7 @@ impl Open for HttpSink {
             format,
             tx: Some(tx),
             pending: Vec::with_capacity(CHUNK_BYTES * 2),
+            stop,
         }
     }
 }
@@ -319,6 +391,33 @@ mod tests {
         assert_eq!(&h[40..44], &u32::MAX.to_le_bytes());
         assert_eq!(u32::from_le_bytes(h[24..28].try_into().unwrap()), RATE);
         assert_eq!(u32::from_le_bytes(h[28..32].try_into().unwrap()), 176_400);
+    }
+
+    /// The bug this guards: the listener used to live in a detached thread that outlived
+    /// the sink, so the port stayed bound. A CLI never notices -- it is exiting anyway --
+    /// but an embedder that stops and starts again cannot bind its own address.
+    #[test]
+    fn dropping_the_sink_frees_the_port() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let addr = probe.local_addr().expect("the bound address").to_string();
+        drop(probe);
+
+        let sink = HttpSink::open(Some(addr.clone()), AudioFormat::S16);
+        assert!(
+            std::net::TcpListener::bind(&addr).is_err(),
+            "the sink should be holding the port while it is alive"
+        );
+        drop(sink);
+
+        // Up to ACCEPT_POLL to notice, plus room for a slow machine.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if std::net::TcpListener::bind(&addr).is_ok() {
+                return;
+            }
+            thread::sleep(ACCEPT_POLL);
+        }
+        panic!("the port was still bound {addr} after the sink was dropped");
     }
 
     #[test]

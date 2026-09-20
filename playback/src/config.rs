@@ -110,6 +110,13 @@ pub struct PlayerConfig {
     /// Overlap consecutive tracks by this much. `Duration::ZERO` disables crossfading.
     pub crossfade: Duration,
 
+    /// Crossfade consecutive tracks of the same album too.
+    ///
+    /// Off by default, which is what Spotify itself is believed to do: an album's own
+    /// mastering already handles those joins, so overlapping them fights the record.
+    /// On for anyone who would rather never hear a gap.
+    pub crossfade_albums: bool,
+
     pub normalisation: bool,
     pub normalisation_type: NormalisationType,
     pub normalisation_method: NormalisationMethod,
@@ -144,6 +151,7 @@ impl Default for PlayerConfig {
             normalisation_knee_db: 5.0,
             passthrough: false,
             crossfade: Duration::ZERO,
+            crossfade_albums: false,
             ditherer: Some(mk_ditherer::<TriangularDitherer>),
             position_update_interval: None,
             local_file_directories: Vec::new(),

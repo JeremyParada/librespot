@@ -10,7 +10,8 @@
 //! object Librespot {
 //!     init { System.loadLibrary("librespot_embed") }
 //!     external fun nativeStart(name: String, bind: String, castTo: String?,
-//!                              crossfadeSecs: Int, cacheDir: String): Boolean
+//!                              crossfadeSecs: Int, crossfadeAlbums: Boolean,
+//!                              cacheDir: String): Boolean
 //!     external fun nativeStop()
 //! }
 //! ```
@@ -62,6 +63,7 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeStart(
     bind: JString,
     cast_to: JString,
     crossfade_secs: jint,
+    crossfade_albums: jboolean,
     cache_dir: JString,
 ) -> jboolean {
     init_logging();
@@ -70,6 +72,12 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeStart(
         error!("the instance lock is poisoned; refusing to start");
         return JNI_FALSE;
     };
+    // A worker that ended by itself failed; leaving it parked here would make every
+    // later start a silent no-op that reports success.
+    if running.as_ref().is_some_and(Handle::is_finished) {
+        info!("the previous instance had already died; starting a new one");
+        *running = None;
+    }
     if running.is_some() {
         info!("already running");
         return JNI_TRUE;
@@ -87,6 +95,7 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeStart(
     let mut config = Config::new(name, cache_dir);
     config.bind = bind;
     config.crossfade_secs = crossfade_secs.max(0) as u64;
+    config.crossfade_albums = crossfade_albums == JNI_TRUE;
     // A null Java string arrives as a valid-but-null JString, so an unreadable value here
     // means "no target", not an error.
     config.cast_to = take_string(&mut env, &cast_to).filter(|s| !s.trim().is_empty());
@@ -161,4 +170,44 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeAuthStatus(
     _class: JClass,
 ) -> jint {
     crate::auth_status() as jint
+}
+
+/// Tells librespot the Android API level, which it cannot work out for itself.
+///
+/// `sysinfo` reports the release ("14") and Spotify expects the API level ("34"). With
+/// the release in the user agent the access point still authenticates the session, and
+/// then Spirc's first login5 call is denied with a bare BAD_REQUEST -- a failure that
+/// reads like bad credentials and is not one. Called from `Librespot`'s initialiser so
+/// it cannot be forgotten at one of the entry points.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_librespot_embed_Librespot_nativeSetOsVersion(
+    mut env: JNIEnv,
+    _class: JClass,
+    version: JString,
+) {
+    init_logging();
+    match take_string(&mut env, &version) {
+        Some(version) => {
+            info!("reporting API level {version}");
+            librespot_core::config::set_os_version(version);
+        }
+        None => error!("could not read the API level from the JVM"),
+    }
+}
+
+/// Every Cast device and group on the network, one name per line.
+///
+/// Blocks for the length of an mDNS browse, so the caller must not be on the UI thread.
+/// An empty string means nothing answered, which is not an error: a group that is off
+/// simply is not there.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_librespot_embed_Librespot_nativeDiscover<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+) -> JString<'a> {
+    init_logging();
+    let names = librespot_playback::cast::device_names().join("
+");
+    info!("discovery found {} device(s)", names.lines().count());
+    env.new_string(names).unwrap_or_else(|_| JString::default())
 }

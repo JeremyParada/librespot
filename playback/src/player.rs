@@ -723,6 +723,96 @@ enum PlayerPreload {
 
 type Decoder = Box<dyn AudioDecoder + Send>;
 
+/// True when `next` is the very next track on the same disc of the same album as `current`.
+/// This is the heuristic Spotify's own crossfade is believed to use: consecutive album tracks
+/// are left to gapless playback rather than overlapped, because the album's own mastering
+/// already handles the join. Anything else -- end of album, shuffle, a manual skip, a
+/// different album -- still gets the configured crossfade.
+fn is_gapless_album_continuation(current: &AudioItem, next: &AudioItem) -> bool {
+    let (
+        UniqueFields::Track {
+            album: album_a,
+            disc_number: disc_a,
+            number: num_a,
+            ..
+        },
+        UniqueFields::Track {
+            album: album_b,
+            disc_number: disc_b,
+            number: num_b,
+            ..
+        },
+    ) = (&current.unique_fields, &next.unique_fields)
+    else {
+        return false;
+    };
+
+    album_a == album_b && disc_a == disc_b && *num_b == num_a + 1
+}
+
+/// Feedforward limiter in the log domain, shared by normal playback and the outgoing side of
+/// a crossfade so both get the exact same dynamic treatment.
+/// After: Giannoulis, D., Massberg, M., & Reiss, J.D. (2012). Digital Dynamic Range
+/// Compressor Design—A Tutorial and Analysis. Journal of The Audio Engineering Society, 60,
+/// 399-408. This implementation assumes audio is stereo.
+#[allow(clippy::too_many_arguments)]
+fn apply_dynamic_limiter(
+    samples: &mut [f64],
+    normalisation_factor: f64,
+    volume: f64,
+    threshold_db: f64,
+    knee_db: f64,
+    knee_factor: f64,
+    attack_cf: f64,
+    release_cf: f64,
+    channel: &mut usize,
+    integrators: &mut [f64; 2],
+    peaks: &mut [f64; 2],
+) {
+    for sample in samples.iter_mut() {
+        // step 0: apply gain stage
+        *sample *= normalisation_factor;
+
+        // step 1-4: half-wave rectification and conversion into dB, and gain computer with
+        // soft knee and subtractor
+        let limiter_db = {
+            // Add slight DC offset. Some samples are silence, which is -inf dB and gets the
+            // limiter stuck. Adding a small positive offset prevents this.
+            *sample += f64::MIN_POSITIVE;
+
+            let bias_db = ratio_to_db(sample.abs()) - threshold_db;
+            let knee_boundary_db = bias_db * 2.0;
+            if knee_boundary_db < -knee_db {
+                0.0
+            } else if knee_boundary_db.abs() <= knee_db {
+                let term = knee_boundary_db + knee_db;
+                term * term * knee_factor
+            } else {
+                bias_db
+            }
+        };
+
+        // track left/right channel
+        let ch = *channel;
+        *channel ^= 1;
+
+        // step 5: smooth, decoupled peak detector for each channel
+        let integrator = &mut integrators[ch];
+        let peak = &mut peaks[ch];
+
+        *integrator = f64::max(
+            limiter_db,
+            release_cf * *integrator + (1.0 - release_cf) * limiter_db,
+        );
+        *peak = attack_cf * *peak + (1.0 - attack_cf) * *integrator;
+
+        // steps 6-8: conversion into level and multiplication into gain stage. Find maximum
+        // peak across both channels to couple the gain and maintain stereo imaging.
+        let max_peak = f64::max(peaks[0], peaks[1]);
+        *sample *= db_to_ratio(-max_peak) * volume;
+    }
+}
+
 /// The outgoing track of a crossfade: it keeps decoding after the player has moved on to the
 /// next track, and gets mixed underneath it until the fade is over.
 struct Crossfade {
@@ -734,16 +824,34 @@ struct Crossfade {
     /// Interleaved samples faded so far, out of `total`.
     done: usize,
     total: usize,
+    /// Its own copy of the dynamic limiter's state, inherited at handoff from the player's
+    /// running instance. Without this the outgoing track would drop to flat gain the moment
+    /// it enters the fade, an audible loudness mismatch against the incoming track, which
+    /// keeps running through the real limiter. Kept separate so the two tracks' concurrently
+    /// evolving envelopes don't fight over one shared state.
+    limiter_channel: usize,
+    limiter_integrators: [f64; 2],
+    limiter_peaks: [f64; 2],
 }
 
 impl Crossfade {
-    fn new(decoder: Decoder, normalisation_factor: f64, duration: Duration) -> Self {
+    fn new(
+        decoder: Decoder,
+        normalisation_factor: f64,
+        duration: Duration,
+        limiter_channel: usize,
+        limiter_integrators: [f64; 2],
+        limiter_peaks: [f64; 2],
+    ) -> Self {
         Self {
             decoder: Some(decoder),
             normalisation_factor,
             pending: VecDeque::new(),
             done: 0,
             total: (duration.as_secs_f64() * SAMPLES_PER_SECOND as f64) as usize,
+            limiter_channel,
+            limiter_integrators,
+            limiter_peaks,
         }
     }
 
@@ -1672,17 +1780,34 @@ impl Future for PlayerInternal {
 
             // Start overlapping with the next track once we are within the crossfade window of
             // the end. It has to be preloaded already, otherwise there is nothing to fade into.
+            // Consecutive tracks of the same album are left to gapless instead: an album
+            // mastered to flow together doesn't need an overlap on top of an already-seamless
+            // join, which is what actually sounds wrong (see is_gapless_album_continuation).
             let crossfade_ms = self.config.crossfade.as_millis().min(u32::MAX as u128) as u32;
-            if crossfade_ms > 0
-                && !passthrough
-                && self.crossfade.is_none()
-                && matches!(self.preload, PlayerPreload::Ready { .. })
-                && matches!(self.state,
+            if crossfade_ms > 0 && !passthrough && self.crossfade.is_none() {
+                let due = matches!(self.state,
                     PlayerState::Playing { duration_ms, stream_position_ms, .. }
                         if duration_ms > crossfade_ms
-                            && duration_ms.saturating_sub(stream_position_ms) <= crossfade_ms)
-            {
-                self.begin_crossfade();
+                            && duration_ms.saturating_sub(stream_position_ms) <= crossfade_ms);
+
+                let should_crossfade = due
+                    && match (&self.state, &self.preload) {
+                        (
+                            PlayerState::Playing { audio_item, .. },
+                            PlayerPreload::Ready { loaded_track, .. },
+                        ) => {
+                            self.config.crossfade_albums
+                                || !is_gapless_album_continuation(
+                                    audio_item,
+                                    &loaded_track.audio_item,
+                                )
+                        }
+                        _ => false,
+                    };
+
+                if should_crossfade {
+                    self.begin_crossfade();
+                }
             }
 
             // The outgoing track outlives the state that owned it, so it needs feeding even
@@ -1879,68 +2004,19 @@ impl PlayerInternal {
                                 }
                             }
                             (true, NormalisationMethod::Dynamic) => {
-                                // zero-cost shorthands
-                                let threshold_db = self.config.normalisation_threshold_dbfs;
-                                let knee_db = self.config.normalisation_knee_db;
-                                let attack_cf = self.config.normalisation_attack_cf;
-                                let release_cf = self.config.normalisation_release_cf;
-
-                                for sample in data.iter_mut() {
-                                    // Feedforward limiter in the log domain
-                                    // After: Giannoulis, D., Massberg, M., & Reiss, J.D. (2012).
-                                    // Digital Dynamic Range Compressor Design—A Tutorial and
-                                    // Analysis. Journal of The Audio Engineering Society, 60,
-                                    // 399-408.
-
-                                    // This implementation assumes audio is stereo.
-
-                                    // step 0: apply gain stage
-                                    *sample *= normalisation_factor;
-
-                                    // step 1-4: half-wave rectification and conversion into dB, and
-                                    // gain computer with soft knee and subtractor
-                                    let limiter_db = {
-                                        // Add slight DC offset. Some samples are silence, which is
-                                        // -inf dB and gets the limiter stuck. Adding a small
-                                        // positive offset prevents this.
-                                        *sample += f64::MIN_POSITIVE;
-
-                                        let bias_db = ratio_to_db(sample.abs()) - threshold_db;
-                                        let knee_boundary_db = bias_db * 2.0;
-                                        if knee_boundary_db < -knee_db {
-                                            0.0
-                                        } else if knee_boundary_db.abs() <= knee_db {
-                                            let term = knee_boundary_db + knee_db;
-                                            term * term * self.normalisation_knee_factor
-                                        } else {
-                                            bias_db
-                                        }
-                                    };
-
-                                    // track left/right channel
-                                    let channel = self.normalisation_channel;
-                                    self.normalisation_channel ^= 1;
-
-                                    // step 5: smooth, decoupled peak detector for each channel
-                                    // Use direct references to reduce repeated array indexing
-                                    let integrator = &mut self.normalisation_integrators[channel];
-                                    let peak = &mut self.normalisation_peaks[channel];
-
-                                    *integrator = f64::max(
-                                        limiter_db,
-                                        release_cf * *integrator + (1.0 - release_cf) * limiter_db,
-                                    );
-                                    *peak = attack_cf * *peak + (1.0 - attack_cf) * *integrator;
-
-                                    // steps 6-8: conversion into level and multiplication into gain
-                                    // stage. Find maximum peak across both channels to couple the
-                                    // gain and maintain stereo imaging.
-                                    let max_peak = f64::max(
-                                        self.normalisation_peaks[0],
-                                        self.normalisation_peaks[1],
-                                    );
-                                    *sample *= db_to_ratio(-max_peak) * volume;
-                                }
+                                apply_dynamic_limiter(
+                                    data,
+                                    normalisation_factor,
+                                    volume,
+                                    self.config.normalisation_threshold_dbfs,
+                                    self.config.normalisation_knee_db,
+                                    self.normalisation_knee_factor,
+                                    self.config.normalisation_attack_cf,
+                                    self.config.normalisation_release_cf,
+                                    &mut self.normalisation_channel,
+                                    &mut self.normalisation_integrators,
+                                    &mut self.normalisation_peaks,
+                                );
                             }
                             (true, NormalisationMethod::Basic) => {
                                 if normalisation_factor < 1.0 || volume < 1.0 {
@@ -2007,6 +2083,9 @@ impl PlayerInternal {
             decoder,
             normalisation_factor,
             self.config.crossfade,
+            self.normalisation_channel,
+            self.normalisation_integrators,
+            self.normalisation_peaks,
         ));
 
         self.send_event(PlayerEvent::EndOfTrack {
@@ -2018,16 +2097,49 @@ impl PlayerInternal {
     /// Fade `data` (the incoming track) in while mixing the outgoing track out underneath it,
     /// on an equal-power curve so the transition holds a constant loudness.
     fn mix_crossfade(&mut self, data: &mut [f64]) {
-        // ponytail: the outgoing track gets basic gain, not the dynamic limiter. Running a
-        // second limiter state for a stream that is on its way to silence buys nothing.
         let volume = self.volume_getter.attenuation_factor();
 
         let Some(fade) = self.crossfade.as_mut() else {
             return;
         };
 
-        let faded_out = fade.take(data.len());
-        let gain = fade.normalisation_factor * volume;
+        let mut faded_out = fade.take(data.len());
+
+        // Give the outgoing track the same normalisation/limiting treatment normal playback
+        // would give it, so its loudness doesn't change the moment it enters the fade.
+        match (self.config.normalisation, self.config.normalisation_method) {
+            (false, _) => {
+                if volume < 1.0 {
+                    for sample in faded_out.iter_mut() {
+                        *sample *= volume;
+                    }
+                }
+            }
+            (true, NormalisationMethod::Dynamic) => {
+                apply_dynamic_limiter(
+                    &mut faded_out,
+                    fade.normalisation_factor,
+                    volume,
+                    self.config.normalisation_threshold_dbfs,
+                    self.config.normalisation_knee_db,
+                    self.normalisation_knee_factor,
+                    self.config.normalisation_attack_cf,
+                    self.config.normalisation_release_cf,
+                    &mut fade.limiter_channel,
+                    &mut fade.limiter_integrators,
+                    &mut fade.limiter_peaks,
+                );
+            }
+            (true, NormalisationMethod::Basic) => {
+                if fade.normalisation_factor < 1.0 || volume < 1.0 {
+                    let gain = fade.normalisation_factor * volume;
+                    for sample in faded_out.iter_mut() {
+                        *sample *= gain;
+                    }
+                }
+            }
+        }
+
         let total = fade.total as f64;
         let start = fade.done as f64;
 
@@ -2036,7 +2148,7 @@ impl PlayerInternal {
             *sample *= progress.sqrt();
 
             if let Some(outgoing) = faded_out.get(i) {
-                *sample += outgoing * gain * (1.0 - progress).sqrt();
+                *sample += outgoing * (1.0 - progress).sqrt();
             }
         }
 
@@ -2886,6 +2998,58 @@ where
 mod tests {
     use super::*;
     use crate::decoder::{DecoderError, DecoderResult};
+    use librespot_metadata::artist::ArtistsWithRole;
+
+    fn track_item(album: &str, disc_number: u32, number: u32) -> AudioItem {
+        AudioItem {
+            track_id: SpotifyUri::from_uri("spotify:track:0000000000000000000000").unwrap(),
+            uri: String::new(),
+            files: AudioFiles(HashMap::new()),
+            name: String::new(),
+            covers: Vec::new(),
+            language: Vec::new(),
+            duration_ms: 0,
+            is_explicit: false,
+            availability: Ok(()),
+            alternatives: None,
+            unique_fields: UniqueFields::Track {
+                artists: ArtistsWithRole::default(),
+                album: album.to_string(),
+                album_artists: Vec::new(),
+                popularity: 0,
+                number,
+                disc_number,
+            },
+        }
+    }
+
+    #[test]
+    fn crossfades_between_different_albums() {
+        let a = track_item("Album A", 1, 3);
+        let b = track_item("Album B", 1, 4);
+        assert!(!is_gapless_album_continuation(&a, &b));
+    }
+
+    #[test]
+    fn crossfades_across_a_disc_boundary() {
+        let a = track_item("Same Album", 1, 12);
+        let b = track_item("Same Album", 2, 1);
+        assert!(!is_gapless_album_continuation(&a, &b));
+    }
+
+    #[test]
+    fn crossfades_when_skipping_ahead_within_an_album() {
+        let a = track_item("Same Album", 1, 3);
+        let b = track_item("Same Album", 1, 5);
+        assert!(!is_gapless_album_continuation(&a, &b));
+    }
+
+    #[test]
+    fn stays_gapless_for_the_immediate_next_track_on_the_album() {
+        let a = track_item("Same Album", 1, 3);
+        let b = track_item("Same Album", 1, 4);
+        assert!(is_gapless_album_continuation(&a, &b));
+    }
 
     struct StubDecoder {
         packets: Vec<Vec<f64>>,
@@ -2918,6 +3082,9 @@ mod tests {
             Box::new(StubDecoder { packets }),
             1.0,
             Duration::from_secs(1),
+            0,
+            [0.0; 2],
+            [0.0; 2],
         )
     }
 

@@ -11,9 +11,9 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::audio_backend::http::idle_for;
+use crate::audio_backend::http::{idle_for, listeners};
 use log::{info, warn};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rust_cast::channels::media::{Media, StreamType};
@@ -39,6 +39,11 @@ const IDLE_RELEASE: Duration = Duration::from_secs(10 * 60);
 const ACTIVE_WITHIN: Duration = Duration::from_secs(5);
 
 const POLL: Duration = Duration::from_secs(2);
+
+/// How long audio may play with nobody pulling the stream before the session counts as
+/// dead. Long enough to cover a receiver that has been told to play and has not opened
+/// the connection yet.
+const DEAD_SESSION: Duration = Duration::from_secs(20);
 
 /// Blocks until the player is producing audio, so nothing is cast before there is
 /// anything to listen to.
@@ -67,6 +72,23 @@ pub fn pick<'a>(found: &'a [Device], target: &str) -> Option<&'a Device> {
     found
         .iter()
         .find(|d| d.name.trim().eq_ignore_ascii_case(target))
+}
+
+/// Every Cast device and group on the network, by the name a person would recognise.
+///
+/// Sorted, because it is shown in a list: discovery order is arrival order, which
+/// reshuffles the list under the user between one browse and the next.
+pub fn device_names() -> Vec<String> {
+    let mut names: Vec<String> = discover()
+        .unwrap_or_else(|e| {
+            warn!("cast: could not browse for devices: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    names.sort();
+    names
 }
 
 /// Browses mDNS for the discovery window and returns every Cast endpoint seen, keyed by
@@ -109,10 +131,53 @@ fn discover() -> Result<Vec<Device>, Box<dyn std::error::Error>> {
 /// a VPN will otherwise happily advertise an address the speaker cannot route to. No
 /// packet is actually sent; connecting a UDP socket just fixes the route.
 fn local_ip_towards(host: &str, port: u16) -> Option<IpAddr> {
-    let addr: SocketAddr = format!("{host}:{port}").parse().ok()?;
-    let sock = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    sock.connect(addr).ok()?;
+    // `host` is already an address, so parse it as one. Formatting it back into
+    // "host:port" and parsing that drops every IPv6 device on the floor, because a
+    // SocketAddr wants the address in brackets there.
+    let ip: IpAddr = match host.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            warn!("cast: <{host}> is not an address: {e}");
+            return None;
+        }
+    };
+
+    // The socket has to be of the same family as the device, or connecting it fails and
+    // the route question never gets asked.
+    let bind: SocketAddr = if ip.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        ([0u16; 8], 0).into()
+    };
+    let sock = match UdpSocket::bind(bind) {
+        Ok(sock) => sock,
+        Err(e) => {
+            warn!("cast: could not open a socket towards {ip}: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = sock.connect(SocketAddr::new(ip, port)) {
+        warn!("cast: no route to {ip}:{port}: {e}");
+        return None;
+    }
     sock.local_addr().ok().map(|a| a.ip())
+}
+
+/// Whether a session with audio playing but nobody listening has gone on long enough to
+/// call it dead.
+///
+/// Kept apart from the network loop so it can be exercised without a Chromecast.
+fn session_is_dead(
+    playing: bool,
+    listeners: usize,
+    silent_since: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !playing || listeners > 0 {
+        *silent_since = None;
+        return false;
+    }
+    now.duration_since(*silent_since.get_or_insert(now)) >= DEAD_SESSION
 }
 
 /// Casts once and stays attached until the connection drops, answering heartbeats.
@@ -146,10 +211,31 @@ fn attach(device: &Device, stream_port: u16) -> Result<(), Box<dyn std::error::E
 
     info!("Casting {url} to <{}>", device.name);
 
+    let mut silent_since = None;
     loop {
         match cast.receive() {
             Ok(ChannelMessage::Heartbeat(_)) => {
                 cast.heartbeat.pong()?;
+
+                // A receiver can stop playing while this connection stays up and keeps
+                // answering heartbeats: on a Chromecast the system kills its own
+                // receiver under memory pressure, which leaves a session that looks
+                // healthy from here and plays nothing. Audio going out with nobody
+                // reading it is the only sign of it, so it is what we watch.
+                if session_is_dead(
+                    idle_for().is_some_and(|d| d <= ACTIVE_WITHIN),
+                    listeners(),
+                    &mut silent_since,
+                    Instant::now(),
+                ) {
+                    warn!(
+                        "<{}> stopped pulling the stream; casting again",
+                        device.name
+                    );
+                    let _ = cast.receiver.stop_app(app.session_id.as_str());
+                    return Ok(());
+                }
+
                 // The device pings every few seconds, which is a good enough clock to
                 // notice a long idle without polling anything ourselves.
                 if idle_for().is_some_and(|d| d >= IDLE_RELEASE) {
@@ -210,6 +296,29 @@ pub fn spawn(target: String, stream_port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_nobody_listens_to_is_dead_only_after_the_grace_period() {
+        let t0 = Instant::now();
+        let mut since = None;
+
+        // Just cast: playing, and the receiver has not opened the stream yet. Not dead.
+        assert!(!session_is_dead(true, 0, &mut since, t0));
+        assert!(!session_is_dead(true, 0, &mut since, t0 + DEAD_SESSION / 2));
+        // Still nobody once the grace period is up: dead.
+        assert!(session_is_dead(true, 0, &mut since, t0 + DEAD_SESSION));
+
+        // A listener turning up clears it, and the wait starts over.
+        assert!(!session_is_dead(true, 1, &mut since, t0 + DEAD_SESSION));
+        assert_eq!(since, None);
+        assert!(!session_is_dead(true, 0, &mut since, t0 + DEAD_SESSION));
+
+        // Paused with nobody listening is normal, not a dead session: pausing must not
+        // tear a cast down, since holding the group between tracks is the point.
+        let mut since = None;
+        assert!(!session_is_dead(false, 0, &mut since, t0));
+        assert!(!session_is_dead(false, 0, &mut since, t0 + DEAD_SESSION * 10));
+    }
 
     fn dev(name: &str) -> Device {
         Device {

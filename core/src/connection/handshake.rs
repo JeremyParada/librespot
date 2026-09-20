@@ -110,7 +110,7 @@ where
     let mut client_nonce = vec![0; 0x10];
     rand::rng().fill_bytes(&mut client_nonce);
 
-    let platform = match crate::config::OS {
+    let platform = match crate::config::os() {
         "freebsd" | "netbsd" | "openbsd" => match ARCH {
             "x86_64" => Platform::PLATFORM_FREEBSD_X86_64,
             _ => Platform::PLATFORM_FREEBSD_X86,

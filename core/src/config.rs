@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{fmt, path::PathBuf, str::FromStr, sync::OnceLock};
 
 use librespot_protocol::devices::DeviceType as ProtoDeviceType;
 use url::Url;
@@ -13,11 +13,50 @@ pub(crate) const IOS_CLIENT_ID: &str = "58bd3c95768941ea9eb4350aaa033eb3";
 /// See [std::env::consts::OS]
 pub const OS: &str = std::env::consts::OS;
 
+/// Set once, before any session exists, when the host operating system is not the
+/// identity Spotify should be told about.
+static OS_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Overrides [os]. Only the first call counts.
+///
+/// Android is the case this exists for. Credentials are tied to the client id that
+/// minted them, so an embedder that signs in with the keymaster id -- the one the
+/// desktop CLI uses -- has to keep presenting itself as that same desktop client for the
+/// rest of the session. Announcing Android instead gets the session authenticated by the
+/// access point and then denied by login5 with a bare BAD_REQUEST.
+pub fn set_os(os: impl Into<String>) {
+    let _ = OS_OVERRIDE.set(os.into());
+}
+
+/// The operating system librespot reports to Spotify: [OS], unless [set_os] changed it.
+pub fn os() -> &'static str {
+    match OS_OVERRIDE.get() {
+        Some(os) => os.as_str(),
+        None => OS,
+    }
+}
+
 // valid versions for some os:
 // 'android': 30
 // 'ios': 17
+/// Set once, before any session exists, when the host knows better than [sysinfo] does.
+///
+/// On Android `sysinfo` reports the release ("14"), while Spotify expects the API level
+/// ("34"); a release number there is accepted by the access point and then rejected by
+/// login5 with a bare BAD_REQUEST. Embedders pass the real API level through here.
+static OS_VERSION: OnceLock<String> = OnceLock::new();
+
+/// Overrides [os_version]. Only the first call counts; later ones are ignored, so a
+/// second embedder cannot change the identity of an already-running session.
+pub fn set_os_version(version: impl Into<String>) {
+    let _ = OS_VERSION.set(version.into());
+}
+
 /// See [sysinfo::System::os_version]
 pub fn os_version() -> String {
+    if let Some(version) = OS_VERSION.get() {
+        return version.clone();
+    }
     sysinfo::System::os_version().unwrap_or("0".into())
 }
 
@@ -54,7 +93,10 @@ impl SessionConfig {
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self::default_for_os(OS)
+        // `os()`, not `OS`: an embedder that announces a different platform has to get
+        // the client id that matches it here too. A stored credential and a client id
+        // that disagree is exactly what login5 denies, with a bare BAD_REQUEST.
+        Self::default_for_os(os())
     }
 }
 
