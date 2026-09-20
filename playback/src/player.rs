@@ -731,13 +731,13 @@ type Decoder = Box<dyn AudioDecoder + Send>;
 fn is_gapless_album_continuation(current: &AudioItem, next: &AudioItem) -> bool {
     let (
         UniqueFields::Track {
-            album: album_a,
+            album_id: album_a,
             disc_number: disc_a,
             number: num_a,
             ..
         },
         UniqueFields::Track {
-            album: album_b,
+            album_id: album_b,
             disc_number: disc_b,
             number: num_b,
             ..
@@ -747,6 +747,8 @@ fn is_gapless_album_continuation(current: &AudioItem, next: &AudioItem) -> bool 
         return false;
     };
 
+    // By id: two different records called "Greatest Hits" with consecutive track numbers
+    // would otherwise be joined as if they were one album, and lose their crossfade.
     album_a == album_b && disc_a == disc_b && *num_b == num_a + 1
 }
 
@@ -3000,7 +3002,24 @@ mod tests {
     use crate::decoder::{DecoderError, DecoderResult};
     use librespot_metadata::artist::ArtistsWithRole;
 
+    /// A stable album URI per test album name, so two tracks "on the same album" share
+    /// an id and two on different ones do not. Spotify ids are 22 base62 characters.
+    fn album_uri(name: &str) -> SpotifyUri {
+        let kept: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        // Padded in front: 22 base62 characters can exceed the 128 bits an id holds, and
+        // leading zeros keep the value small enough whatever the name is.
+        let padded = format!("{kept:0>22}");
+        SpotifyUri::from_uri(&format!("spotify:album:{}", &padded[padded.len() - 22..])).unwrap()
+    }
+
     fn track_item(album: &str, disc_number: u32, number: u32) -> AudioItem {
+        // Same name, same record: the usual case.
+        track_item_on(album, album, disc_number, number)
+    }
+
+    /// A track whose album name and album id are set apart, for the case where two
+    /// different records share a name.
+    fn track_item_on(album: &str, id: &str, disc_number: u32, number: u32) -> AudioItem {
         AudioItem {
             track_id: SpotifyUri::from_uri("spotify:track:0000000000000000000000").unwrap(),
             uri: String::new(),
@@ -3014,6 +3033,7 @@ mod tests {
             alternatives: None,
             unique_fields: UniqueFields::Track {
                 artists: ArtistsWithRole::default(),
+                album_id: album_uri(id),
                 album: album.to_string(),
                 album_artists: Vec::new(),
                 popularity: 0,
@@ -3021,6 +3041,16 @@ mod tests {
                 disc_number,
             },
         }
+    }
+
+    #[test]
+    fn two_records_sharing_a_name_are_not_one_album() {
+        // The bug this guards: comparing album names folded every artist's "Greatest
+        // Hits" into a single record, so the join between two of them was treated as an
+        // album's own gapless sequence and lost its crossfade.
+        let a = track_item_on("Greatest Hits", "one", 1, 3);
+        let b = track_item_on("Greatest Hits", "two", 1, 4);
+        assert!(!is_gapless_album_continuation(&a, &b));
     }
 
     #[test]

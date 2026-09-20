@@ -49,6 +49,7 @@ impl EventHandler {
                                 match audio_item.unique_fields {
                                     UniqueFields::Track {
                                         artists,
+                                        album_id: _,
                                         album,
                                         album_artists,
                                         popularity,

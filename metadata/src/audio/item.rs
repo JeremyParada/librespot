@@ -44,6 +44,10 @@ pub struct AudioItem {
 pub enum UniqueFields {
     Track {
         artists: ArtistsWithRole,
+        /// The album this track belongs to. Names collide -- every artist with a
+        /// "Greatest Hits" shares one -- so anything deciding whether two tracks sit on
+        /// the same record has to compare this, not the name below.
+        album_id: SpotifyUri,
         album: String,
         album_artists: Vec<String>,
         popularity: u8,
@@ -88,6 +92,7 @@ impl AudioItem {
                 }
 
                 let uri_string = uri.to_uri();
+                let album_id = track.album.id;
                 let album = track.album.name;
 
                 let album_artists = track
@@ -122,6 +127,7 @@ impl AudioItem {
 
                 let unique_fields = UniqueFields::Track {
                     artists: track.artists_with_role,
+                    album_id,
                     album,
                     album_artists,
                     popularity,
