@@ -207,6 +207,25 @@ pub fn begin_device_auth(config: Config) -> Result<DeviceAuth, Error> {
 
 #[cfg(target_os = "android")]
 mod jni_bridge;
+pub mod now_playing;
+
+/// A QR code for `text`, one row per line, `1` for a dark module and `0` for a light
+/// one, or `None` if it does not fit. Drawing it is left to the host: a TV app built
+/// without dependencies has no QR encoder of its own, and a matrix is all it needs.
+pub fn qr_matrix(text: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let width = code.width();
+    let rows: Vec<String> = code
+        .to_colors()
+        .chunks(width)
+        .map(|row| {
+            row.iter()
+                .map(|c| if *c == qrcode::Color::Dark { '1' } else { '0' })
+                .collect()
+        })
+        .collect();
+    Some(rows.join("\n"))
+}
 
 /// Everything the host has to decide. Kept small on purpose: anything with a sane default
 /// is not worth a knob the app has to thread through JNI.
@@ -416,6 +435,7 @@ fn run(
         let player = Player::new(player_config, session.clone(), soft_volume, move || {
             (backend)(device, AudioFormat::S16)
         });
+        tokio::spawn(now_playing::follow(player.get_player_event_channel()));
 
         #[cfg(feature = "cast")]
         if let Some(target) = config.cast_to.clone() {
@@ -447,6 +467,7 @@ fn run(
         }
 
         session.shutdown();
+        now_playing::clear();
     });
 }
 
@@ -463,6 +484,15 @@ fn port_of(bind: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_qr_is_square_and_made_of_modules() {
+        let m = qr_matrix("https://spotify.com/pair?code=E67TLQ").unwrap();
+        let rows: Vec<&str> = m.lines().collect();
+        assert!(rows.len() >= 21);
+        assert!(rows.iter().all(|r| r.len() == rows.len()));
+        assert!(m.chars().all(|c| matches!(c, '0' | '1' | '\n')));
+    }
 
     #[test]
     fn reads_the_port_out_of_a_bind_address() {

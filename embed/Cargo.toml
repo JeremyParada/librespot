@@ -17,6 +17,9 @@ crate-type = ["lib", "cdylib"]
 librespot-core = { workspace = true }
 librespot-connect = { workspace = true }
 librespot-oauth = { workspace = true }
+librespot-metadata = { workspace = true }
+# Para el QR de vinculacion: sin features no arrastra `image`, solo la matriz.
+qrcode = { version = "0.14", default-features = false }
 # The http backend is not optional here: it is the only output this crate has, and
 # `start` now waits on the port it serves, so its absence is a compile error rather
 # than a crate that builds and then refuses to play.

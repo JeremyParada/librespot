@@ -141,6 +141,32 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeIsRunning(
     }
 }
 
+/// What is playing, as the lines [`crate::now_playing::snapshot`] describes, or an
+/// empty string when nothing is loaded.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_librespot_embed_Librespot_nativeNowPlaying<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+) -> JString<'a> {
+    init_logging();
+    let text = crate::now_playing::snapshot().unwrap_or_default();
+    env.new_string(text).unwrap_or_else(|_| JString::default())
+}
+
+/// A QR code for the given text as rows of `0`/`1`, or an empty string.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_librespot_embed_Librespot_nativeQr<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    text: JString,
+) -> JString<'a> {
+    init_logging();
+    let out = take_string(&mut env, &text)
+        .and_then(|t| crate::qr_matrix(&t))
+        .unwrap_or_default();
+    env.new_string(out).unwrap_or_else(|_| JString::default())
+}
+
 /// Starts a device sign-in and returns "CODE|URL" to display, or an empty string if it
 /// could not even be started.
 ///
@@ -222,8 +248,10 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeDiscover<'a>(
     _class: JClass,
 ) -> JString<'a> {
     init_logging();
-    let names = librespot_playback::cast::device_names().join("
-");
+    let names = librespot_playback::cast::device_names().join(
+        "
+",
+    );
     info!("discovery found {} device(s)", names.lines().count());
     env.new_string(names).unwrap_or_else(|_| JString::default())
 }
