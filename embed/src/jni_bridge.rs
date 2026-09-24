@@ -125,6 +125,22 @@ pub extern "system" fn Java_org_librespot_embed_Librespot_nativeStop(_env: JNIEn
     }
 }
 
+/// Whether an instance is up and its worker still alive.
+///
+/// The worker ends by itself when Spirc does -- a dropped connection, a session Spotify
+/// expired days in -- and nothing else says so: the service keeps its notification and
+/// the device quietly vanishes from Spotify. The host polls this to notice and restart.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_librespot_embed_Librespot_nativeIsRunning(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    match RUNNING.lock() {
+        Ok(running) if running.as_ref().is_some_and(|h| !h.is_finished()) => JNI_TRUE,
+        _ => JNI_FALSE,
+    }
+}
+
 /// Starts a device sign-in and returns "CODE|URL" to display, or an empty string if it
 /// could not even be started.
 ///
